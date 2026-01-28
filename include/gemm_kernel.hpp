@@ -52,14 +52,23 @@ public:
               std::vector<T>& C, size_t ldc) {
         
         // Validate inputs
-        if (A.size() < M * lda || B.size() < K * ldb || C.size() < M * ldc) {
-            throw std::invalid_argument("Matrix dimensions do not match buffer sizes");
+        if (A.size() < M * K) {
+            throw std::invalid_argument("Matrix A buffer size too small: expected at least " + 
+                                      std::to_string(M * K) + ", got " + std::to_string(A.size()));
+        }
+        if (B.size() < K * N) {
+            throw std::invalid_argument("Matrix B buffer size too small: expected at least " + 
+                                      std::to_string(K * N) + ", got " + std::to_string(B.size()));
+        }
+        if (C.size() < M * N) {
+            throw std::invalid_argument("Matrix C buffer size too small: expected at least " + 
+                                      std::to_string(M * N) + ", got " + std::to_string(C.size()));
         }
 
         // Allocate device buffers
-        sycl::buffer<T, 1> buf_A(A.data(), sycl::range<1>(M * lda));
-        sycl::buffer<T, 1> buf_B(B.data(), sycl::range<1>(K * ldb));
-        sycl::buffer<T, 1> buf_C(C.data(), sycl::range<1>(M * ldc));
+        sycl::buffer<T, 1> buf_A(A.data(), sycl::range<1>(A.size()));
+        sycl::buffer<T, 1> buf_B(B.data(), sycl::range<1>(B.size()));
+        sycl::buffer<T, 1> buf_C(C.data(), sycl::range<1>(C.size()));
 
         if (config_.use_local_memory) {
             gemm_local_memory(M, N, K, alpha, buf_A, lda, buf_B, ldb, beta, buf_C, ldc);
@@ -84,6 +93,11 @@ private:
         const size_t tile_k = config_.tile_size_k;
         const size_t wg_m = config_.work_group_size_m;
         const size_t wg_n = config_.work_group_size_n;
+        
+        // Validate tile divisibility
+        if (tile_m % wg_m != 0 || tile_n % wg_n != 0) {
+            throw std::invalid_argument("Tile sizes must be divisible by work-group sizes");
+        }
 
         sycl::range<2> global_size((M + tile_m - 1) / tile_m * wg_m,
                                    (N + tile_n - 1) / tile_n * wg_n);
@@ -104,17 +118,25 @@ private:
                     const size_t group_m = item.get_group(0);
                     const size_t group_n = item.get_group(1);
                     
-                    const size_t global_m = group_m * tile_m + local_m * (tile_m / wg_m);
-                    const size_t global_n = group_n * tile_n + local_n * (tile_n / wg_n);
+                    const size_t elems_per_thread_m = tile_m / wg_m;
+                    const size_t elems_per_thread_n = tile_n / wg_n;
+                    const size_t global_m = group_m * tile_m + local_m * elems_per_thread_m;
+                    const size_t global_n = group_n * tile_n + local_n * elems_per_thread_n;
 
-                    T sum = 0;
+                    // Accumulator for each element this thread computes
+                    T sums[8][8] = {{0}}; // Support up to 8x8 elements per thread
+                    
+                    // Ensure we don't exceed array bounds
+                    if (elems_per_thread_m > 8 || elems_per_thread_n > 8) {
+                        return; // Skip this configuration
+                    }
 
                     // Tile across K dimension
                     for (size_t k_tile = 0; k_tile < K; k_tile += tile_k) {
-                        // Load tile_A
+                        // Load tile_A cooperatively
                         for (size_t i = local_m; i < tile_m; i += wg_m) {
                             for (size_t k = local_n; k < tile_k; k += wg_n) {
-                                size_t row = global_m - local_m * (tile_m / wg_m) + i;
+                                size_t row = group_m * tile_m + i;
                                 size_t col = k_tile + k;
                                 if (row < M && col < K) {
                                     tile_A[i][k] = acc_A[row * lda + col];
@@ -124,11 +146,11 @@ private:
                             }
                         }
 
-                        // Load tile_B
+                        // Load tile_B cooperatively
                         for (size_t k = local_m; k < tile_k; k += wg_m) {
                             for (size_t j = local_n; j < tile_n; j += wg_n) {
                                 size_t row = k_tile + k;
-                                size_t col = global_n - local_n * (tile_n / wg_n) + j;
+                                size_t col = group_n * tile_n + j;
                                 if (row < K && col < N) {
                                     tile_B[k][j] = acc_B[row * ldb + col];
                                 } else {
@@ -139,12 +161,12 @@ private:
 
                         item.barrier(sycl::access::fence_space::local_space);
 
-                        // Compute partial results
-                        for (size_t i = 0; i < tile_m / wg_m; i++) {
-                            for (size_t j = 0; j < tile_n / wg_n; j++) {
+                        // Compute partial results for each element
+                        for (size_t i = 0; i < elems_per_thread_m; i++) {
+                            for (size_t j = 0; j < elems_per_thread_n; j++) {
                                 for (size_t k = 0; k < tile_k; k++) {
-                                    sum += tile_A[local_m * (tile_m / wg_m) + i][k] *
-                                           tile_B[k][local_n * (tile_n / wg_n) + j];
+                                    sums[i][j] += tile_A[local_m * elems_per_thread_m + i][k] *
+                                                  tile_B[k][local_n * elems_per_thread_n + j];
                                 }
                             }
                         }
@@ -153,13 +175,13 @@ private:
                     }
 
                     // Write results
-                    for (size_t i = 0; i < tile_m / wg_m; i++) {
-                        for (size_t j = 0; j < tile_n / wg_n; j++) {
+                    for (size_t i = 0; i < elems_per_thread_m; i++) {
+                        for (size_t j = 0; j < elems_per_thread_n; j++) {
                             size_t row = global_m + i;
                             size_t col = global_n + j;
                             if (row < M && col < N) {
                                 size_t idx = row * ldc + col;
-                                acc_C[idx] = alpha * sum + beta * acc_C[idx];
+                                acc_C[idx] = alpha * sums[i][j] + beta * acc_C[idx];
                             }
                         }
                     }

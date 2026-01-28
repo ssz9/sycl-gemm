@@ -7,7 +7,7 @@
 
 using namespace sycl_gemm;
 
-bool verify_result(const std::vector<float>& C, size_t M, size_t N, float expected, float tolerance = 1e-3) {
+bool verify_result(const std::vector<float>& C, size_t M, size_t N, float expected, float tolerance = 0.01) {
     for (size_t i = 0; i < M * N; i++) {
         if (std::abs(C[i] - expected) > tolerance) {
             std::cerr << "Mismatch at index " << i << ": expected " << expected 

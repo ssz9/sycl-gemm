@@ -5,6 +5,7 @@
 #include <vector>
 #include <chrono>
 #include <iomanip>
+#include <cstdlib>
 
 using namespace sycl_gemm;
 

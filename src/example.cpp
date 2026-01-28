@@ -10,6 +10,12 @@ using namespace sycl_gemm;
 
 /**
  * @brief Helper function to verify GEMM result
+ * @param C Result matrix to verify
+ * @param M Number of rows
+ * @param N Number of columns  
+ * @param K Inner dimension (used to compute expected value)
+ * @param expected_value Expected value for each element
+ * @param tolerance Absolute tolerance for comparison
  */
 template<typename T>
 bool verify_gemm(const std::vector<T>& C, size_t M, size_t N, size_t K, T expected_value, T tolerance = 1e-3) {

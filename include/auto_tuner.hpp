@@ -34,8 +34,13 @@ public:
         
         std::vector<GemmConfig> configs = generate_configs();
         
-        GemmConfig best_config;
+        if (configs.empty()) {
+            throw std::runtime_error("No valid configurations found for device");
+        }
+        
+        GemmConfig best_config = configs[0]; // Initialize with first config
         double best_time = std::numeric_limits<double>::max();
+        bool found_valid = false;
 
         // Test data
         std::vector<T> A(M * K, 1.0);
@@ -54,11 +59,16 @@ public:
                 if (avg_time < best_time) {
                     best_time = avg_time;
                     best_config = config;
+                    found_valid = true;
                 }
             } catch (const std::exception& e) {
                 // Configuration not supported, skip it
                 continue;
             }
+        }
+        
+        if (!found_valid) {
+            throw std::runtime_error("All configurations failed - unable to auto-tune");
         }
 
         std::cout << "Best configuration: tile=" << best_config.tile_size_m 
@@ -146,6 +156,11 @@ private:
             for (size_t wg : wg_sizes) {
                 // Skip if work-group size exceeds device limit
                 if (wg * wg > max_work_group_size_) {
+                    continue;
+                }
+                
+                // Skip if tile is not divisible by work-group size
+                if (tile % wg != 0) {
                     continue;
                 }
                 
